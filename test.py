@@ -377,10 +377,10 @@ def test(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("AdaptCLIP", add_help=True)
     # paths
-    parser.add_argument("--test_data_path", type=str, default="./data/visa", help="path to test dataset")
+    parser.add_argument("--test_data_path", type=str, default=r"E:\projects\datasets\Visa", help="path to test dataset")
     parser.add_argument("--save_path", type=str, default='./results/', help='base output directory; results are saved under <test_data_path folder>/<k_shots>/')
-    parser.add_argument("--pretrained_model", type=str, default=DEFAULT_PRETRAINED_MODEL, help="pre-trained model name")
-    parser.add_argument("--checkpoint_path", type=str, default='./adaptclip_checkpoint/', help='path to checkpoint')
+    parser.add_argument("--pretrained_model", type=str, default=r"E:/projects/FSAD/AdaptCLIP/checkpoint/train_base/ViT-L-14-336px.pt", help="pre-trained model name")
+    parser.add_argument("--checkpoint_path", type=str, default='.\\checkpoint\\epoch_15.pth', help='path to checkpoint')
     # model
     parser.add_argument("--dataset", type=str, default='mvtec')
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
