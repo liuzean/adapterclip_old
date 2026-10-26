@@ -8,7 +8,7 @@ import sys
 
 # 路径配置；常用测试参数位于文件末尾的 __main__ 中。
 DATASET_ROOT = Path(r"E:\projects\datasets")
-CHECKPOINT_PATH = Path("checkpoint") / "epoch_15.pth"
+CHECKPOINT_PATH = Path("checkpoint") / "mvtec_three_adapters_ctx_seed10" / "epoch_15.pth"
 SAVE_PATH = Path("results")
 
 PROJECT_DIR = Path(__file__).resolve().parent

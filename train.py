@@ -213,7 +213,7 @@ if __name__ == '__main__':
     parser.add_argument("--train_data_path", type=str, default=r"E:\projects\datasets\mvtec", help="train dataset path")
     parser.add_argument("--save_path", type=str, default='./checkpoint', help='path to save results')
     parser.add_argument("--dataset", type=str, default='mvtec', help="train dataset name")
-    parser.add_argument("--pretrained_model", type=str, default=DEFAULT_PRETRAINED_MODEL, help="pre-trained model name")
+    parser.add_argument("--pretrained_model", type=str, default=r"E:/projects/FSAD/AdaptCLIP/checkpoint/train_base/ViT-L-14-336px.pt", help="pre-trained model name")
     parser.add_argument("--n_ctx", type=int, default=12, help="the textual prompt length of textual learner")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
     parser.add_argument("--epoch", type=int, default=15, help="epochs")
