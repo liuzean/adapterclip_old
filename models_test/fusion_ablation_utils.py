@@ -74,7 +74,7 @@ def path_key(value):
     return str(Path(value).resolve()).casefold()
 
 
-def audit_source(source, shot, project_root):
+def audit_source(source, shot, project_root, expected_dataset="visa"):
     """Read metadata/CSV only; return config, exact reference rows and manifest.
 
     References are looked up in TRAIN metadata without random sampling. Duplicate
@@ -87,15 +87,18 @@ def audit_source(source, shot, project_root):
     required = set(MODEL_KEYS) | {"k_shots"}
     if required - config.keys():
         raise ValueError(f"Missing config fields: {sorted(required - config.keys())}")
-    if (config["dataset"], config["seed"], config["k_shots"]) != ("visa", 10, shot):
+    if expected_dataset not in ("visa", "btad", "mpdd", "SDD", "DTD", "part_glass"):
+        raise ValueError(f"Unsupported diagnostic dataset: {expected_dataset}")
+    if (config["dataset"], config["seed"], config["k_shots"]) != (expected_dataset, 10, shot):
         raise ValueError(f"Unexpected dataset/seed/shot in {source}")
     if config["features_list"] != [6, 12, 18, 24] or config["fusion_type"] != "average_mean":
         raise ValueError("This predefined experiment requires layers 6/12/18/24 and average_mean.")
     if not all(config[key] is True for key in ("visual_learner", "textual_learner", "pq_learner", "pq_context")):
         raise ValueError("All three adapters and PQContext must be enabled.")
-    if (status.get("status") != "completed" or status.get("evaluation_scope") != "full_visa"
+    expected_scope = "full_visa" if expected_dataset == "visa" else "full_dataset"
+    if (status.get("status") != "completed" or status.get("evaluation_scope") != expected_scope
             or config.get("smoke_per_type", 0)):
-        raise ValueError(f"Source is not a completed full VisA run: {source}")
+        raise ValueError(f"Source is not a completed full {expected_dataset} run: {source}")
     for key in ("test_data_path", "pretrained_model", "checkpoint_path"):
         config[key] = str(project_path(config[key], project_root))
         if not Path(config[key]).exists():
@@ -103,8 +106,10 @@ def audit_source(source, shot, project_root):
     root = Path(config["test_data_path"])
     metadata = read_json(root / "meta.json")
     classes = list(metadata["test"])
-    if len(classes) != 12:
+    if expected_dataset == "visa" and len(classes) != 12:
         raise ValueError("Expected 12 VisA classes.")
+    if not classes:
+        raise ValueError("Empty test class list.")
     train = {path_key(root / row["img_path"]): row
              for rows in metadata["train"].values() for row in rows}
     references, reference_paths = [], []
@@ -140,12 +145,21 @@ def audit_source(source, shot, project_root):
         if int(row["anomaly"]) and not (root / row["mask_path"]).is_file():
             raise FileNotFoundError(root / row["mask_path"])
     diagnostics = []
-    for stem, label in (("000", "Anomaly"), ("001", "Anomaly"), ("002", "Anomaly"), ("0790", "Normal")):
-        matches = [r for r in manifest if r["Category"] == "macaroni1"
-                   and r["Sample Type"] == label and Path(r["Image Path"]).stem == stem]
-        if len(matches) != 1:
-            raise ValueError(f"Cannot uniquely locate macaroni1 {label}/{stem} in source manifest.")
-        diagnostics.append(matches[0])
+    if expected_dataset == "visa":
+        for stem, label in (("000", "Anomaly"), ("001", "Anomaly"), ("002", "Anomaly"), ("0790", "Normal")):
+            matches = [r for r in manifest if r["Category"] == "macaroni1"
+                       and r["Sample Type"] == label and Path(r["Image Path"]).stem == stem]
+            if len(matches) != 1:
+                raise ValueError(f"Cannot uniquely locate macaroni1 {label}/{stem} in source manifest.")
+            diagnostics.append(matches[0])
+    else:
+        # Same four-image diagnostic budget as fusion_ablation, with no VisA
+        # category/stem assumptions or selection based on prediction quality.
+        for label, count in (("Anomaly", 3), ("Normal", 1)):
+            candidates = [r for r in manifest if r["Category"] == classes[0] and r["Sample Type"] == label]
+            if len(candidates) < count:
+                raise ValueError(f"Insufficient fixed {label} diagnostics in {classes[0]}.")
+            diagnostics.extend(candidates[:count])
     metrics = {}
     for level, filename in (("I", "image_metrics.csv"), ("P", "pixel_metrics.csv")):
         rows = [r for r in read_csv(source / filename) if r["Branch"] == "FINAL"

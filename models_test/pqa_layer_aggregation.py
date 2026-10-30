@@ -74,7 +74,7 @@ def save_sample(args, source, output, sample, image, mask, raw, maps, index):
     if args.save_visualizations:
         save_panels(output / "visualizations" / relative.with_suffix(".png"), image, mask.numpy(), raw_arrays,
                     evaluated, list(CONDITIONS), 3,
-                    f"VisA {source['config']['k_shots']}-shot / {sample['Category']} / {sample['Sample Key']}")
+                    f"{source['config']['dataset']} {source['config']['k_shots']}-shot / {sample['Category']} / {sample['Sample Key']}")
     if args.save_maps:
         for stage, arrays in (("raw", raw_arrays), ("evaluated", evaluated)):
             directory = output / "raw_maps" / relative / stage

@@ -71,7 +71,7 @@ def save_sample(args, source, output, sample, image, mask, raw, maps, index):
     if args.save_visualizations:
         save_panels(output / "visualizations" / relative.with_suffix(".png"), image, mask.numpy(),
                     raw_arrays, evaluated, list(BASE_CONDITIONS), 2,
-                    f"VisA {source['config']['k_shots']}-shot / {sample['Category']} / {sample['Sample Key']} / "
+                    f"{source['config']['dataset']} {source['config']['k_shots']}-shot / {sample['Category']} / {sample['Sample Key']} / "
                     f"dual pixel={'baseline' if args.disable_dual_output else 'no_TA'}; image=baseline")
     checks = []
     for stage, field, arrays in (("raw", "Raw Maps", raw_arrays), ("evaluated", "Evaluated Maps", evaluated)):

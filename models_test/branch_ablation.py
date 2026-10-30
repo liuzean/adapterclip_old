@@ -132,7 +132,7 @@ def diagnose_sample(args, source, output, sample, image, mask, raw, evaluated, e
             for name, value in arrays.items()]
     relative = Path(sample["Category"]) / sample["Sample Type"] / sample["Sample Key"]
     if args.save_visualizations:
-        title = f"VisA {source['config']['k_shots']}-shot seed=10 / {sample['Category']} / {sample['Sample Key']}"
+        title = f"{source['config']['dataset']} {source['config']['k_shots']}-shot seed=10 / {sample['Category']} / {sample['Sample Key']}"
         save_panels(output / "visualizations/pqa_layers" / relative.with_suffix(".png"),
                     image, mask_array, raw_arrays, smooth_arrays,
                     [f"PQA_L{layer}" for layer in source["config"]["features_list"]]

@@ -74,7 +74,7 @@ def save_sample(args, source, output, sample, image, mask, raw, maps, index):
     if args.save_visualizations:
         save_panels(output / "visualizations" / relative.with_suffix(".png"), image, mask.numpy(),
                     raw_arrays, arrays, list(CONDITIONS), 3,
-                    f"VisA {source['config']['k_shots']}-shot / {sample['Category']} / "
+                    f"{source['config']['dataset']} {source['config']['k_shots']}-shot / {sample['Category']} / "
                     "PCA is residual/4, not probability; fixed display range")
     if args.save_maps:
         for stage, values in (("raw", raw_arrays), ("evaluated", arrays)):
