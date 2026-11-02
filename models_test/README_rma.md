@@ -1,5 +1,52 @@
 # RMA：冻结原模型，新增可训练参考匹配分支
 
+## 实验九的两组训练设置 2026年11月2日补充
+
+同一份 train_rma.py 通过 `--training_profile` 切换，默认 legacy_rma 保持历史实验九设置。
+不复制训练脚本、不覆盖旧权重。新的 adaptclip 组仅对齐用户指定的七项训练设置，并非完整复现原训练：
+仍加载旧 epoch_15，冻结 CLIP/VA/TA/PQA，只训练新 RMA；保留原实验九的源域划分、融合监督、梯度裁剪、验证选优和测试流程。
+
+| 设置 | legacy_rma 历史实验九 | adaptclip 参数对齐组 |
+|---|---|---|
+| 每查询训练参考数 | 每小批轮换1/2/4 | 每查询随机1张 |
+| 实际batch | 2 | 8 |
+| 梯度累积 | 4批 | 1批 即不累积 |
+| 优化器 | AdamW | Adam |
+| 学习率 | 1e-4 | 1e-3 |
+| betas | 0.9,0.999 | 0.5,0.999 |
+| weight_decay | 1e-4 | 0 |
+
+训练参考数通过独立 `--train_reference_shots` 管理；测试 `--shots` 与源域验证1/2/4-shot均不改变它。
+单参考用 random.Random.choice，多参考按原历史代码用 sample；同seed不保证跨batch设置得到相同训练episode。
+两组源域划分与验证参考身份固定不变。目标六数据集的历史参考名单和评价协议也不变。
+`profile_overrides` 会记录显式参数覆盖；例如改成batch4后不能声称七项全部与官方一致。
+
+在项目根目录运行新的训练、保存每轮权重、测试18个条件并自动比较历史B：
+
+```powershell
+python .\models_test\rma_pipeline.py --training_profile adaptclip --save_every_epoch --comparison_run .\results\test_rma\pipeline_20261030_210844_733256
+```
+
+本次只使用B专用流水线，不需要运行会接着训练C的 run_rma_pipelines.py。
+这里“一次训练”为默认15个epoch；若明确只试1个epoch，可额外 --epochs 1，但其训练预算与旧15轮不相等。
+
+单独训练或复用历史设置：
+
+```powershell
+python .\models_test\train_rma.py --training_profile adaptclip --save_every_epoch
+python .\models_test\train_rma.py --training_profile legacy_rma
+```
+
+新流水线/训练/测试目录名带 adaptclip 前缀，均仍在各入口同名 results 目录内，重复运行创建新会话。
+`best.pth`按原实验九的源域验证选优；每轮权重只作记录，不根据目标测试指标挑轮次。
+新测试目录保留新B减原A的差值；流水线会话的 `training_setting_comparison/` 保存新B减旧B的六项差值、逐类别差值与每shot保留判断。
+对比前核对源域划分、冻结初始化权重、模型结构、目标协议、参考与查询身份。七项同时改变，不能据此归因到某一个参数。
+若终端已显示 Evaluation completed，而之后在比较汇总处报错，先核对训练和测试各自的 run_status.json；
+不应直接重新运行整条流水线。2026-11-02 已修复汇总错误读取 train_options.seed 的问题，seed 实际存放于 model_manifest.json 顶层。
+本次现有结果的离线补汇总及状态说明见 results/rma_pipeline/adaptclip_six_datasets_seed10/postprocessing_recovery.json；
+原 failed 状态保留为历史记录，训练、测试和权重没有重跑或覆盖。
+新组尚未实际训练，batch8峰值显存未实测；若不足，应明确记录实际覆盖值，不自动降batch冒充官方配置。
+
 这是待实跑的实验候选，不是已证实的提升，也不是完整复现 RAID/DictAS。
 原始 `train.py`、`test.py`、三个适配器源码及所有历史实验均不修改。
 

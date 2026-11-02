@@ -16,6 +16,13 @@ from rma_utils import (
     failure_status, freeze_base, fuse_rma, save_tables, source_spec, source_split, validation_score,
 )
 
+TRAINING_PROFILES = {
+    'legacy_rma': dict(batch_size=2, accumulation=4, optimizer='adamw', learning_rate=1e-4,
+                       betas=[.9, .999], weight_decay=1e-4, train_reference_shots=[1, 2, 4]),
+    'adaptclip': dict(batch_size=8, accumulation=1, optimizer='adam', learning_rate=1e-3,
+                     betas=[.5, .999], weight_decay=0., train_reference_shots=[1]),
+}
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
@@ -23,10 +30,16 @@ def parse_args(argv=None):
     p.add_argument('--base_checkpoint', default='checkpoint/mvtec_three_adapters_ctx_seed10/epoch_15.pth')
     p.add_argument('--pretrained_model', default='E:/projects/FSAD/AdaptCLIP/checkpoint/train_base/ViT-L-14-336px.pt')
     p.add_argument('--epochs', type=int, default=15)
-    p.add_argument('--batch_size', type=int, default=2)
-    p.add_argument('--accumulation', type=int, default=4)
-    p.add_argument('--learning_rate', type=float, default=1e-4)
-    p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--training_profile', choices=TRAINING_PROFILES, default='legacy_rma',
+                   help='legacy_rma preserves experiment 9; adaptclip aligns seven training settings only.')
+    p.add_argument('--batch_size', type=int)
+    p.add_argument('--accumulation', type=int)
+    p.add_argument('--optimizer', choices=('adam', 'adamw'))
+    p.add_argument('--learning_rate', type=float)
+    p.add_argument('--betas', nargs=2, type=float)
+    p.add_argument('--weight_decay', type=float)
+    p.add_argument('--train_reference_shots', nargs='+', type=int, choices=(1, 2, 4),
+                   help='Training references PER query, cycled per minibatch; unrelated to test --shots.')
     p.add_argument('--validation_fraction', type=float, default=.2)
     p.add_argument('--fusion_weight', type=float, default=1.)
     p.add_argument('--hidden_dim', type=int, default=128)
@@ -37,6 +50,12 @@ def parse_args(argv=None):
     p.add_argument('--save_every_epoch', action='store_true')
     p.add_argument('--_output', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    preset = TRAINING_PROFILES[args.training_profile]
+    args.profile_overrides = [k for k, v in preset.items() if getattr(args, k) is not None and getattr(args, k) != v]
+    for key, value in preset.items():
+        if getattr(args, key) is None:
+            setattr(args, key, list(value) if isinstance(value, list) else value)
+    args.sampling_method = 'choice' if args.train_reference_shots == [1] else 'sample_without_replacement'
     if min(args.epochs, args.batch_size, args.accumulation, args.top_k, args.match_chunk) < 1 or args.num_workers < 0:
         p.error('Epochs, sizes and accumulation must be positive; workers nonnegative.')
     if args.hidden_dim < 8 or args.hidden_dim % 8:
@@ -46,6 +65,10 @@ def parse_args(argv=None):
         p.error('Invalid finite optimizer/loss settings.')
     if not 0 < args.validation_fraction < 1:
         p.error('validation_fraction must be between zero and one.')
+    if any(not math.isfinite(v) or not 0 <= v < 1 for v in args.betas):
+        p.error('Both betas must be finite in [0,1).')
+    if len(set(args.train_reference_shots)) != len(args.train_reference_shots):
+        p.error('Training reference counts must not repeat.')
     for name in ('train_data_path', 'base_checkpoint', 'pretrained_model'):
         setattr(args, name, project_path(getattr(args, name), ROOT))
     return args
@@ -124,7 +147,9 @@ def train(args, output, logger):
     frozen = freeze_base(initialized)
     adapter = ReferenceMatchingAdapter(hidden_dim=args.hidden_dim, top_k=args.top_k,
         image_size=config.image_size, chunk=args.match_chunk, matching=args.matching).to(device)
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer_class = torch.optim.Adam if args.optimizer == 'adam' else torch.optim.AdamW
+    optimizer = optimizer_class(adapter.parameters(), lr=args.learning_rate, betas=tuple(args.betas),
+                                weight_decay=args.weight_decay)
     check_frozen(frozen, optimizer)
     focal, dice = FocalLoss(), BinaryDiceLoss()
     base_hash, pretrained_hash = digest(args.base_checkpoint), digest(args.pretrained_model)
@@ -144,10 +169,11 @@ def train(args, output, logger):
         optimizer.zero_grad(set_to_none=True)
         epoch_rows = []
         for step, items in enumerate(tqdm(loader, desc=f'RMA epoch {epoch}/{args.epochs}')):
-            shot = (1, 2, 4)[(len(steps)) % 3]
+            shot = args.train_reference_shots[len(steps) % len(args.train_reference_shots)]
             rows = []
             for path, category in zip(items['img_path'], items['cls_name']):
-                chosen = rng.sample(split['training_support_pool'][category], shot)
+                pool = split['training_support_pool'][category]
+                chosen = [rng.choice(pool)] if args.sampling_method == 'choice' else rng.sample(pool, shot)
                 rows.extend(chosen)
                 episode_rows.append(dict(epoch=epoch, step=step+1, query=path, category=category, shot=shot,
                                          references=' | '.join(r['img_path'] for r in chosen)))
@@ -234,7 +260,8 @@ def main(argv=None):
             raise ValueError('Internal output must be a new direct train_rma session.')
         output.mkdir(parents=True, exist_ok=False)
     else:
-        output = new_directory(ROOT/'results'/Path(__file__).stem, 'mvtec_seed10')
+        output = new_directory(ROOT/'results'/Path(__file__).stem,
+                               'mvtec_seed10' if args.training_profile == 'legacy_rma' else 'adaptclip_mvtec_seed10')
     logger = logging.getLogger('rma-training')
     logger.setLevel(logging.INFO)
     handlers = [logging.FileHandler(output/'train.log', encoding='utf-8'), logging.StreamHandler()]

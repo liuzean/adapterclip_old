@@ -274,3 +274,79 @@ def record_pipeline_progress(path, phase, **details):
     temporary = path.with_name(path.name + '.tmp')
     write_json(temporary, dict(phase=phase, **details))
     temporary.replace(path)
+
+
+def compare_training_runs(old_run, new_run, output):
+    """Offline comparison of two completed B runs, with identical target protocol.
+
+    New minus old answers the training-settings question. New minus original A
+    remains the separate algorithm baseline comparison in the test session.
+    """
+    from fusion_ablation_utils import read_csv
+    datasets = ('Visa', 'BTAD', 'MPDD', 'SDD', 'DTD', 'part_glass')
+    old_run, new_run, output = Path(old_run), Path(new_run), Path(output)
+    if old_run.resolve() == new_run.resolve():
+        raise ValueError('Training comparison requires distinct old and new runs.')
+    campaigns = [read_json(r/'campaign_config.json') for r in (old_run, new_run)]
+    manifests = []
+    for root, campaign in zip((old_run, new_run), campaigns):
+        if read_json(root/'run_status.json').get('complete') is not True:
+            raise ValueError('Both comparison test runs must be complete.')
+        manifests.append(read_json(Path(campaign['checkpoint']).parent/'model_manifest.json'))
+    for key in ('base_sha256', 'pretrained_sha256', 'source_split_sha256', 'model_spec'):
+        if manifests[0][key] != manifests[1][key]:
+            raise ValueError(f'Training comparison differs in fixed model/data field: {key}')
+    # Training manifests store seed beside train_options, including legacy B runs.
+    if manifests[0]['seed'] != manifests[1]['seed']:
+        raise ValueError('Training comparison differs in fixed model/data field: seed')
+    for key in ('validation_fraction', 'fusion_weight', 'matching', 'hidden_dim', 'top_k'):
+        if manifests[0]['train_options'][key] != manifests[1]['train_options'][key]:
+            raise ValueError(f'Unexpected training change beyond settings profile: {key}')
+    if campaigns[0]['datasets'] != campaigns[1]['datasets'] or campaigns[0]['shots'] != campaigns[1]['shots']:
+        raise ValueError('Training comparison requires the same ordered target dataset/shot scope.')
+    rows = []
+    for dataset in campaigns[1]['datasets']:
+        for shot in campaigns[1]['shots']:
+            dirs = [r/dataset/f'{shot}shot_seed10' for r in (old_run, new_run)]
+            configs = [read_json(d/'experiment_config.json') for d in dirs]
+            for key in ('seed','k_shots','dataset','test_data_path','pretrained_model','checkpoint_path',
+                        'image_size','features_list','sigma','batch_size','n_ctx','vl_reduction','pq_mid_dim','pq_context',
+                        'fusion_type','visual_learner','textual_learner','pq_learner','disable_rma'):
+                if configs[0][key] != configs[1][key]:
+                    raise ValueError(f'Target evaluation protocol changed: {dataset}/{shot}/{key}')
+            for filename in ('references.csv', 'sample_manifest.csv'):
+                if read_csv(dirs[0]/filename) != read_csv(dirs[1]/filename):
+                    raise ValueError(f'Historical target identities differ: {filename}')
+            for d in dirs:
+                state = read_json(d/'run_status.json')
+                if state.get('complete') is not True or state.get('baseline_parity_passed') is not True:
+                    raise ValueError('Incomplete round or original-A parity failure.')
+            tables = [{(r['Category'],r['Condition']):r for r in read_csv(d/'metrics_combined.csv')} for d in dirs]
+            if set(tables[0]) != set(tables[1]):
+                raise ValueError('Category/condition sets differ.')
+            for category, condition in tables[1]:
+                if condition == 'baseline':
+                    if any(float(tables[0][category,condition][f]) != float(tables[1][category,condition][f]) for f in FIELDS):
+                        raise ValueError('Original-A outputs differ between the two training tests.')
+                    continue
+                if condition != 'rma':
+                    raise ValueError('Only two B/RMA-only runs can be compared here.')
+                delta = {f:float(tables[1][category,condition][f])-float(tables[0][category,condition][f]) for f in FIELDS}
+                rows.append(dict(Dataset=dataset, Shot=shot, Category=category, **delta, Net=sum(delta.values())))
+    output.mkdir(parents=True, exist_ok=False)
+    for filename, is_mean in (('new_minus_old_by_dataset.csv',True),('new_minus_old_by_category.csv',False)):
+        write_csv(output/filename,['Dataset','Shot','Category',*FIELDS,'Net'],[r for r in rows if (r['Category']=='Mean')==is_mean])
+    summary = []
+    for shot in campaigns[1]['shots']:
+        group=[r for r in rows if r['Shot']==shot and r['Category']=='Mean']
+        gain=sum(max(r['Net'],0) for r in group)
+        loss=-sum(min(r['Net'],0) for r in group)
+        positive=sum(r['Net']>0 for r in group)
+        complete={r['Dataset'] for r in group}==set(datasets)
+        summary.append(dict(Shot=shot, PositiveDatasets=positive, Gains=gain, Losses=loss,
+                            Net=gain-loss, SixDatasetsComplete=complete, Retain=bool(complete and positive>=3 and gain>loss)))
+    write_csv(output/'new_minus_old_retention.csv',list(summary[0]),summary)
+    write_json(output/'comparison_config.json',dict(old_test_run=str(old_run),new_test_run=str(new_run),
+        old_training_options=manifests[0]['train_options'],new_training_options=manifests[1]['train_options'],
+        original_A_comparison='See new test session deltas_vs_original.csv and retention_by_shot.csv',
+        interpretation='Seven training settings changed together; does not isolate the cause to a single parameter.'))
