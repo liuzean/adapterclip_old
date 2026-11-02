@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
 
 from context_alignment import DATASETS
 from fusion_ablation_utils import new_directory, project_path, read_json, write_json
-from rma_utils import failure_status, run_child
+from rma_utils import failure_status, record_pipeline_progress, run_child
 from test_rma import preflight
 from train_rma import parse_args as parse_training_args
 
@@ -26,6 +26,7 @@ def parse_args(argv=None):
     p.add_argument('--save_maps', action='store_true')
     p.add_argument('--save_visualizations', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--train_help', action='store_true', help='Show train_rma training options and exit.')
+    p.add_argument('--_progress_file', help=argparse.SUPPRESS)
     args, training_options = p.parse_known_args(argv)
     if args.train_help:
         parse_training_args(['--help'])
@@ -43,6 +44,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args, training, training_options = parse_args(argv)
+    receipt = project_path(args._progress_file, ROOT) if args._progress_file else None
+    record_pipeline_progress(receipt, 'preflight')
     jobs, audit = preflight(args)
     # Input/path validation before expensive training; no target predictions here.
     for path in (training.base_checkpoint, training.pretrained_model, training.train_data_path/'meta.json'):
@@ -52,12 +55,16 @@ def main(argv=None):
     token = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     train_output = ROOT/'results/train_rma'/f'pipeline_{token}'
     test_output = ROOT/'results/test_rma'/f'pipeline_{token}'
+    progress = dict(session=str(session), train_output=str(train_output), test_output=str(test_output),
+                    epochs=training.epochs, evaluation_jobs=jobs)
+    record_pipeline_progress(receipt, 'initializing', **progress)
     write_json(session/'input_audit.json', audit)
     write_json(session/'execution_plan.json', dict(train_output=str(train_output), test_output=str(test_output),
         training_arguments=training_options, evaluation_jobs=jobs,
         checkpoint_selection='best full-model MVTec source validation; no target selection'))
     try:
         write_json(session/'run_status.json', dict(status='training', complete=False))
+        record_pipeline_progress(receipt, 'training', **progress)
         run_child([sys.executable, '-u', str(ROOT/'models_test/train_rma.py'),
                    *training_options, '--_output', str(train_output)])
         status = read_json(train_output/'run_status.json')
@@ -70,6 +77,7 @@ def main(argv=None):
         if fresh_audit != audit:
             raise ValueError('Target historical inputs changed during training.')
         write_json(session/'run_status.json', dict(status='testing', complete=False, best_checkpoint=str(best)))
+        record_pipeline_progress(receipt, 'testing', **progress)
         command = [sys.executable, '-u', str(ROOT/'models_test/test_rma.py'), '--checkpoint', str(best),
                    '--_output', str(test_output), '--datasets', *args.datasets,
                    '--shots', *[str(s) for s in args.shots], '--num_workers', str(training.num_workers)]
@@ -84,6 +92,7 @@ def main(argv=None):
             raise RuntimeError('Target evaluation incomplete.')
         write_json(session/'run_status.json', dict(status='completed', complete=True,
             train_output=str(train_output), test_output=str(test_output), best_checkpoint=str(best)))
+        record_pipeline_progress(receipt, 'completed', **progress)
     except BaseException as error:
         failure_status(session, error)
         raise

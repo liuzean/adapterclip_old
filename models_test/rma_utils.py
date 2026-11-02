@@ -253,5 +253,24 @@ def validate_checkpoint_payload(payload, base_hash, pretrained_hash, protocol):
 
 
 def failure_status(output, error):
-    write_json(Path(output)/'run_status.json', dict(status='interrupted' if isinstance(error, KeyboardInterrupt)
-               else 'failed', complete=False, error=str(error)))
+    # Preserve the last epoch/dataset/shot when marking a failure.
+    path = Path(output)/'run_status.json'
+    try:
+        previous = read_json(path)
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError):
+        previous = {}
+    previous.update(status='interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+                    complete=False, error=str(error))
+    write_json(path, previous)
+
+
+def record_pipeline_progress(path, phase, **details):
+    """Optional exact-session receipt for an outer scheduler; no model changes."""
+    if path is None:
+        return
+    path = Path(path)
+    temporary = path.with_name(path.name + '.tmp')
+    write_json(temporary, dict(phase=phase, **details))
+    temporary.replace(path)
