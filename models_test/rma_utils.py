@@ -106,17 +106,18 @@ def fuse_rma(old_raw, extras, fixed_global, global_logits, local_logits, sigma=N
 class MetricsBuffer:
     """One category on host RAM, original evaluator, independent conditions."""
 
-    def __init__(self, category):
+    def __init__(self, category, conditions=CONDITIONS):
         self.category = category
+        self.conditions = tuple(conditions)
         self.masks, self.labels = [], []
-        self.maps = {n: [] for n in CONDITIONS}
-        self.scores = {n: [] for n in CONDITIONS}
+        self.maps = {n: [] for n in self.conditions}
+        self.scores = {n: [] for n in self.conditions}
 
     def append(self, mask, label, maps, scores, index):
         import torch
         self.masks.append(mask.cpu().to(dtype=torch.uint8).clone())
         self.labels.append(int(label))
-        for name in CONDITIONS:
+        for name in self.conditions:
             if not maps[name][index].isfinite().all() or not scores[name][index].isfinite().all():
                 raise ValueError('Nonfinite evaluated output.')
             self.maps[name].append(maps[name][index].detach().cpu().clone())
@@ -128,7 +129,7 @@ class MetricsBuffer:
         from tools import Evaluator
         masks, labels = torch.stack(self.masks).int(), torch.tensor(self.labels).int()
         pixels, images = [], []
-        for name in CONDITIONS:
+        for name in self.conditions:
             maps, scores = torch.stack(self.maps[name]), torch.stack(self.scores[name])
             self.maps[name].clear()
             evaluator = Evaluator(device, metrics=[f'P-{n}' for n in ('AUROC', 'AP', 'F1max')])

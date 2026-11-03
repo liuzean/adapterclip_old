@@ -73,7 +73,8 @@ def save_example(args, source, output, sample, image, mask, raw, maps, index):
     return checks
 
 
-def inference(args, source, control, output, logger, checkpoint_hash):
+def inference(args, source, control, output, logger, checkpoint_hash, *,
+              checkpoint_validator=validate_joint_checkpoint, candidate_name=None):
     import torch
     from fusion_ablation import infer_batch, initialize
     from rma_model import ReferenceMatchingAdapter
@@ -82,7 +83,7 @@ def inference(args, source, control, output, logger, checkpoint_hash):
     from tqdm import tqdm
     setup_seed(10)
     payload = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    validate_joint_checkpoint(payload, digest(source['config']['checkpoint_path']),
+    checkpoint_validator(payload, digest(source['config']['checkpoint_path']),
                               digest(source['config']['pretrained_model']), source['config'])
     initialized = initialize(source, output, args.num_workers, logger)
     config, model, textual, visual, pq, original_text, memory, loader, dpam, device = initialized
@@ -95,7 +96,7 @@ def inference(args, source, control, output, logger, checkpoint_hash):
     del payload
     with torch.no_grad():
         candidate_text = encode_learned_text(model, adapters[0])
-    candidate = THREE_ONLY if args.disable_rma else JOINT
+    candidate = candidate_name or (THREE_ONLY if args.disable_rma else JOINT)
     pixels, images, score_rows, checks, matrix_checks = [], [], [], [], []
     selected = {path_key(r['Image Path']): r for r in source['diagnostics']}
     visited, closed, buffer, count, batches = set(), set(), None, 0, 0
