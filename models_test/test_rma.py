@@ -15,7 +15,7 @@ from fusion_ablation_utils import (
     save_panels, write_csv, write_json,
 )
 from rma_utils import (
-    CONDITIONS, FIELDS, MetricsBuffer, check_frozen, cleanup, digest, failure_status,
+    FIELDS, MetricsBuffer, check_frozen, cleanup, digest, failure_status,
     freeze_base, fuse_rma, run_child, save_tables, validate_checkpoint_payload,
 )
 
@@ -77,11 +77,13 @@ def save_example(args, source, output, sample, image, mask, raw, maps, index):
                 np.save(directory/f'{name}.npy', value, allow_pickle=False)
     if args.save_visualizations:
         save_panels(output/'visualizations'/relative.with_suffix('.png'), image, mask.cpu().numpy(),
-                    raw_arrays, arrays, list(CONDITIONS), 2, 'Original Baseline / frozen base + RMA')
+                    raw_arrays, arrays, list(maps), 2, 'Original Baseline / frozen base + RMA')
     return checks
 
 
-def inference(args, source, control, output, logger, checkpoint_hash):
+def inference(args, source, control, output, logger, checkpoint_hash, *,
+              output_adapter=None, buffer_factory=MetricsBuffer):
+    """Shared inference; optional output routing leaves the default B path intact."""
     import torch
     from fusion_ablation import infer_batch, initialize
     from rma_model import ReferenceMatchingAdapter
@@ -135,6 +137,8 @@ def inference(args, source, control, output, logger, checkpoint_hash):
             raw = dict(baseline=old['baseline'], rma=candidate_raw)
             maps = dict(baseline=old_maps['baseline'], rma=candidate_map)
             scores = dict(baseline=old_scores['baseline'], rma=candidate_score)
+            if output_adapter is not None:
+                output_adapter(raw, maps, scores)
             if args.disable_rma and not (torch.equal(maps['baseline'], maps['rma']) and torch.equal(scores['baseline'], scores['rma'])):
                 raise RuntimeError('Disabled recovery failed.')
             masks = (items['img_mask'][:, 0] > .5).to(torch.uint8)
@@ -149,7 +153,7 @@ def inference(args, source, control, output, logger, checkpoint_hash):
                         closed.add(buffer.category)
                     if category in closed:
                         raise ValueError('Noncontiguous query categories.')
-                    buffer = MetricsBuffer(category)
+                    buffer = buffer_factory(category)
                 buffer.append(masks[index], label, maps, scores, index)
                 row = {'Category': category, 'Image Path': paths[index], 'Label': label,
                        **{f'{n} Global': float(v[index]) for n, v in native.items()},
