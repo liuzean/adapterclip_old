@@ -1,4 +1,12 @@
-"""Old B best.pth: original A, complete B, and A-image/B-final-map dual output."""
+"""Old B best.pth: original A, complete B, and A-image/B-final-map dual output.
+
+实验结论：可保留的改进（2026-11-03核对，当前仅seed=10）。
+六数据集1/2/4-shot均有4/6数据集净提升，六指标总净变化分别为
++2.851214、+1.898651、+1.045633，符合预先约定的保留条件。
+图像检测保留原A最终分数；像素定位使用旧B四分支＋ALIGN＋平滑后的完整最终图。
+收益较小，VisA、SDD三个shot均净下降；不代表所有数据集/指标提升。
+保留为实验候选，不据此自动集成正式模型；其他随机种子尚未验证。
+"""
 import argparse
 import logging
 import sys
