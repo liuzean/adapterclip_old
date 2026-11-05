@@ -1,8 +1,8 @@
-"""Shared FROM-SCRATCH four-adapter training; no old adapter states are loaded.
+"""Shared FROM-SCRATCH adapter training; no old adapter states are loaded.
 
 original: official data/sampling/Adam/loss/epoch protocol plus RMA supervision.
 new: held-out source validation, mixed references, AdamW/accumulation/fusion loss.
-No matched new-flow three-adapter control is scheduled. This limits attribution.
+The separate train_new_d_three entry selects the matched three-adapter control.
 """
 import argparse
 import logging
@@ -24,6 +24,8 @@ from rma_utils import (FIELDS, MetricsBuffer, atomic_checkpoint, check_frozen, c
                        validate_checkpoint_payload, record_pipeline_progress)
 
 FORMAT = 'adaptclip-rma-scratch-v1'
+THREE_FORMAT = 'adaptclip-three-scratch-v1'
+THREE_INITIALIZATION = 'CLIP pretrained; three adapters fresh; no RMA'
 PROFILES = {
     'original': dict(batch_size=8, accumulation=1, learning_rate=.001, weight_decay=0.,
                      betas=[.5, .999], optimizer='adam', train_reference_shots=[1],
@@ -34,7 +36,7 @@ PROFILES = {
 }
 
 
-def parse_training(flow, argv=None):
+def parse_training(flow, argv=None, *, three_adapter_control=False):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument('--train_data_path', default='E:/projects/datasets/mvtec')
     p.add_argument('--pretrained_model', default='E:/projects/FSAD/AdaptCLIP/checkpoint/train_base/ViT-L-14-336px.pt')
@@ -51,9 +53,15 @@ def parse_training(flow, argv=None):
     p.add_argument('--top_k', type=int, default=8)
     p.add_argument('--match_chunk', type=int, default=128)
     p.add_argument('--matching', choices=('learned', 'uniform', 'top1'), default='learned')
+    if three_adapter_control:
+        p.add_argument('--matched_new_d_run', default='results/train_rma_scratch_new/mvtec_seed10',
+                       help='Completed new-D training whose settings, split and episodes must match.')
     p.add_argument('--_progress_file', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     args.flow, args.seed = flow, 10
+    args.three_adapter_control = three_adapter_control
+    if three_adapter_control and flow != 'new':
+        p.error('The matched three-adapter control uses the new-D flow only.')
     args.overrides = []
     for key, value in PROFILES[flow].items():
         if hasattr(args, key) and getattr(args, key) is not None:
@@ -71,6 +79,8 @@ def parse_training(flow, argv=None):
         p.error('Invalid optimizer or validation settings.')
     for name in ('train_data_path', 'pretrained_model', 'baseline_checkpoint'):
         setattr(args, name, project_path(getattr(args, name), ROOT))
+    if three_adapter_control:
+        args.matched_new_d_run = project_path(args.matched_new_d_run, ROOT)
     return args
 
 
@@ -86,7 +96,7 @@ def protocol(args):
 
 
 def initialize_fresh(args, config):
-    """Construct CLIP and fresh TA/VA/PQA in original order, then new RMA.
+    """Construct fresh TA/VA/PQA and optionally RMA in the original order.
 
     CLIP stays frozen while its text path differentiates with respect to prompts.
     RMA initialization RNG is restored so it does not shift original sampling RNG.
@@ -110,20 +120,22 @@ def initialize_fresh(args, config):
     model.to('cuda').eval().requires_grad_(False)
     for module in adapters:
         module.to('cuda').train().requires_grad_(True)
-    cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state_all()
-    rma = ReferenceMatchingAdapter(hidden_dim=args.hidden_dim, top_k=args.top_k,
-        image_size=config.image_size, chunk=args.match_chunk, matching=args.matching).to('cuda')
-    torch.set_rng_state(cpu_rng)
-    torch.cuda.set_rng_state_all(cuda_rng)
+    rma = None
+    if not getattr(args, 'three_adapter_control', False):
+        cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state_all()
+        rma = ReferenceMatchingAdapter(hidden_dim=args.hidden_dim, top_k=args.top_k,
+            image_size=config.image_size, chunk=args.match_chunk, matching=args.matching).to('cuda')
+        torch.set_rng_state(cpu_rng)
+        torch.cuda.set_rng_state_all(cuda_rng)
     adapters[0].prepare_static_text_feature(model)
     return model, adapters, rma
 
 
 def source_validation(config, model, adapters, rma, loader, memory, output, epoch):
-    """Only source-held-out queries; candidate full-model six-metric score."""
+    """Source-held-out full-model score; the three-control never calls RMA."""
     import torch
     from test import prompt_association
-    for module in (*adapters, rma):
+    for module in (*adapters, rma) if rma is not None else adapters:
         module.eval()
     rows = []
     with torch.no_grad():
@@ -136,7 +148,8 @@ def source_validation(config, model, adapters, rma, loader, memory, output, epoc
                 features, patches = model.encode_image(items['img'].cuda(), config.features_list, DPAM_layer=20)
                 pf, pp = prompt_association(*memory, items['cls_name'])
                 pf, pp = pf[:, :shot].cuda(), [p[:, :shot].cuda() for p in pp]
-                _, maps, scores = evaluate_candidate(config, adapters, text, rma, features, patches, pf, pp, items['img_path'])
+                _, maps, scores = evaluate_candidate(config, adapters, text, rma, features, patches, pf, pp,
+                                                     items['img_path'], without_rma=rma is None)
                 for i, category in enumerate(items['cls_name']):
                     if buffer is None or buffer.category != category:
                         if buffer is not None:
@@ -163,6 +176,15 @@ def validate_scratch(payload, base_hash, clip_hash, config, flow):
         raise ValueError('Use the matching FROM-SCRATCH flow checkpoint, not B or warm-start C.')
     if any(k not in payload for k in ('textual_learner', 'visual_learner', 'pq_learner', 'rma')):
         raise ValueError('All four adapter states required.')
+    validate_checkpoint_payload(dict(payload, format='adaptclip-rma-v1'), base_hash, clip_hash, config)
+
+
+def validate_three_scratch(payload, base_hash, clip_hash, config, flow):
+    """Reject four-adapter/old-B checkpoints for the independently trained control."""
+    if (flow != 'new' or payload.get('format') != THREE_FORMAT or payload.get('flow') != flow
+            or payload.get('initialization') != THREE_INITIALIZATION or 'rma' in payload
+            or any(k not in payload for k in ('textual_learner', 'visual_learner', 'pq_learner'))):
+        raise ValueError('Use the new-flow three-adapter control checkpoint, not new D with RMA removed.')
     validate_checkpoint_payload(dict(payload, format='adaptclip-rma-v1'), base_hash, clip_hash, config)
 
 
@@ -210,7 +232,8 @@ def train(args, output, logger):
     config = protocol(args)
     model, adapters, rma = initialize_fresh(args, config)
     frozen = freeze_base([None, model])
-    parameters = [p for m in (*adapters, rma) for p in m.parameters()]
+    modules = (*adapters, rma) if rma is not None else adapters
+    parameters = [p for m in modules for p in m.parameters()]
     optimizer_class = torch.optim.Adam if args.optimizer == 'adam' else torch.optim.AdamW
     optimizer = optimizer_class(parameters, lr=args.learning_rate, betas=tuple(args.betas), weight_decay=args.weight_decay)
     check_frozen(frozen, optimizer)
@@ -241,24 +264,31 @@ def train(args, output, logger):
             raise ValueError('Original-flow trailing batch has one query; choose a documented batch setting for BN.')
         loader = torch.utils.data.DataLoader(data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     write_json(output/'training_queries.json', data.data_all)
-    metadata = dict(format=FORMAT, flow=args.flow, initialization='CLIP pretrained; all four adapters fresh',
-        training_scheme=f'scratch_{args.flow}', model_spec=rma.spec, base_protocol=vars(config),
+    expected_episodes = None
+    if args.three_adapter_control:
+        from new_d_control_utils import check_training_inputs
+        expected_episodes = check_training_inputs(args, output)
+    metadata = dict(format=FORMAT if rma is not None else THREE_FORMAT, flow=args.flow,
+        initialization='CLIP pretrained; all four adapters fresh' if rma is not None else THREE_INITIALIZATION,
+        training_scheme=f'scratch_{args.flow}' if rma is not None else 'new_flow_three_adapter_control',
+        model_spec=rma.spec if rma is not None else dict(input_dim=768, image_size=config.image_size), base_protocol=vars(config),
         base_sha256=digest(args.baseline_checkpoint), pretrained_sha256=digest(args.pretrained_model),
         train_options={k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         source_meta_sha256=digest(args.train_data_path/'meta.json'), seed=10,
-        matched_new_flow_three_adapter_control=False,
+        matched_new_flow_three_adapter_control=rma is None,
         source_validation_used=args.flow == 'new',
         validation_fraction_used=args.validation_fraction if args.flow == 'new' else None,
         comparator_checkpoint_role='original A identity only; NEVER loaded into training',
         selection_rule='minimum epoch mean global_loss + local_loss; earliest on tie; no validation selection' if args.flow == 'original' else 'best held-out source six-metric / 1,2,4-shot mean')
     write_json(output/'model_manifest.json', dict(**metadata, train_query_count=len(data),
         validation_query_count=0 if val_loader is None else len(val_loader.dataset), frozen_modules=['CLIP'],
-        trainable_modules=['VA','TA','PQA','RMA'], trainable_parameters=sum(p.numel() for p in parameters)))
+        trainable_modules=['VA','TA','PQA','RMA'] if rma is not None else ['VA','TA','PQA'],
+        trainable_parameters=sum(p.numel() for p in parameters)))
     focal, dice, rng = FocalLoss(), BinaryDiceLoss(), random.Random(10)
     history, steps, episodes, validation_rows = [], [], [], []
     best_value, best_epoch = (math.inf if args.flow == 'original' else -math.inf), None
     for epoch in range(1, args.epochs+1):
-        for m in (*adapters, rma):
+        for m in modules:
             m.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_rows = []
@@ -278,6 +308,9 @@ def train(args, output, logger):
                     refs.extend(chosen)
                     episodes.append(dict(epoch=epoch, step=step+1, query=path, category=category, shot=shot,
                                          references=' | '.join(r['img_path'] for r in chosen)))
+                    if expected_episodes is not None:
+                        if {k:str(v) for k,v in episodes[-1].items()} != expected_episodes[len(episodes)-1]:
+                            raise ValueError('Training episode differs from matched new D; no matched-control claim is valid.')
                 support_data = RecordedPromptDataset(str(args.train_data_path), refs, split['classes'], transform, target_transform)
                 prompt_images = torch.stack([support_data[i]['img'] for i in range(len(support_data))]).cuda()
             with torch.no_grad():
@@ -314,7 +347,7 @@ def train(args, output, logger):
         selection_value, improved = checkpoint_selection(args.flow, summary, best_value)
         if improved:
             best_value, best_epoch = selection_value, epoch
-        payload = dict(**metadata, **adapter_states(adapters), rma=rma.state_dict(), epoch=epoch,
+        payload = dict(**metadata, **adapter_states(adapters), **({'rma':rma.state_dict()} if rma is not None else {}), epoch=epoch,
                        validation_score=score, best_epoch=best_epoch,
                        best_score=best_value if args.flow == 'new' else None,
                        best_training_loss=best_value if args.flow == 'original' else None)
@@ -337,18 +370,24 @@ def train(args, output, logger):
             best_score=best_value if args.flow == 'new' else None))
         cleanup()
     selected = output/'best.pth'
+    if expected_episodes is not None and len(episodes) != len(expected_episodes):
+        raise ValueError('Incomplete matched new-D episode coverage.')
     return dict(status='completed', complete=True, epochs=args.epochs, flow=args.flow,
                 selected_checkpoint=str(selected), best_epoch=best_epoch,
                 best_training_loss=best_value if args.flow == 'original' else None,
                 best_score=best_value if args.flow == 'new' else None,
-                frozen_integrity_passed=True, four_adapter_gradient_checks_passed=True)
+                frozen_integrity_passed=True,
+                **({'four_adapter_gradient_checks_passed':True} if rma is not None else {'three_adapter_gradient_checks_passed':True}))
 
 
-def training_main(flow, entry_stem, argv=None):
-    args = parse_training(flow, argv)
+def training_main(flow, entry_stem, argv=None, *, three_adapter_control=False):
+    args = parse_training(flow, argv, three_adapter_control=three_adapter_control)
     for path in (args.train_data_path/'meta.json', args.pretrained_model, args.baseline_checkpoint):
         if not path.is_file():
             raise FileNotFoundError(path)
+    if three_adapter_control:
+        from new_d_control_utils import check_training_settings
+        check_training_settings(args)
     output = new_directory(ROOT/'results'/entry_stem, 'mvtec_seed10')
     receipt = project_path(args._progress_file, ROOT) if args._progress_file else None
     record_pipeline_progress(receipt, 'training', session=str(output), flow=flow, epochs=args.epochs)

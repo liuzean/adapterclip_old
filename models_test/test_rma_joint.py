@@ -90,9 +90,11 @@ def inference(args, source, control, output, logger, checkpoint_hash, *,
     frozen = freeze_base(initialized)
     adapters = clone_adapters(initialized)
     load_joint_adapters(adapters, payload)
-    rma = ReferenceMatchingAdapter(**payload['model_spec']).to(device).eval()
-    rma.load_state_dict(payload['rma'], strict=True)
-    rma.requires_grad_(False)
+    rma = None
+    if not args.disable_rma:
+        rma = ReferenceMatchingAdapter(**payload['model_spec']).to(device).eval()
+        rma.load_state_dict(payload['rma'], strict=True)
+        rma.requires_grad_(False)
     del payload
     with torch.no_grad():
         candidate_text = encode_learned_text(model, adapters[0])

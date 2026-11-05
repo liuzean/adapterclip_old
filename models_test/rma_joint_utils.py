@@ -49,7 +49,7 @@ def encode_learned_text(model, textual):
 
 
 def joint_forward(model, adapters, rma, features, patches, pf, pp):
-    """Trainable VA/TA/PQA/RMA outputs from frozen image features.
+    """Trainable VA/TA/PQA and optional RMA from frozen image features.
 
     Unlike diagnostic infer_batch, NEVER detach adapter probabilities here.
     Only ALIGN is constant because it depends on frozen CLIP matching alone.
@@ -63,9 +63,12 @@ def joint_forward(model, adapters, rma, features, patches, pf, pp):
     pq_g, pq_p, alignment = pq(features, patches, pf, pp)
     if len(pq_g) != 4 or len(pq_p) != 4 or len(alignment) != 4:
         raise ValueError('Joint training expects the original four PQA layers.')
-    rma_g, rma_logits = rma(patches, pp)
-    branch_globals = {'VA': [va_g], 'TA': [ta_g], 'PQA': pq_g, 'RMA': [rma_g]}
-    branch_pixels = {'VA': [va_p], 'TA': [ta_p], 'PQA': pq_p, 'RMA': [rma_logits.softmax(1)]}
+    branch_globals = {'VA': [va_g], 'TA': [ta_g], 'PQA': pq_g}
+    branch_pixels = {'VA': [va_p], 'TA': [ta_p], 'PQA': pq_p}
+    if rma is not None:
+        rma_g, rma_logits = rma(patches, pp)
+        branch_globals['RMA'] = [rma_g]
+        branch_pixels['RMA'] = [rma_logits.softmax(1)]
     local_mean = torch.stack([torch.stack(v).mean(0)[:, 1] for v in branch_pixels.values()]).mean(0)
     align = fusion_fun(alignment, fusion_type='harmonic_mean')[:, 0].detach()
     # Algebraic two-input harmonic mean avoids division by zero in backward.
@@ -80,11 +83,13 @@ def joint_forward(model, adapters, rma, features, patches, pf, pp):
 
 
 def joint_losses(globals_, pixels, final_raw, labels, masks, focal, dice, fusion_weight):
-    """Original VA/TA/PQA loss sums, plus RMA and pre-smoothing fusion loss."""
+    """Branch loss sums for three/four adapters plus pre-smoothing fusion loss."""
     import torch
     from torch.nn import functional as F
     components, global_sum, local_sum = {}, 0, 0
-    for name in ('VA', 'TA', 'PQA', 'RMA'):
+    if set(globals_) != set(pixels) or set(globals_) not in ({'VA', 'TA', 'PQA'}, {'VA', 'TA', 'PQA', 'RMA'}):
+        raise ValueError('Expected matching three- or four-adapter branches.')
+    for name in globals_:
         g = sum(F.cross_entropy(v, labels.long()) for v in globals_[name])
         focal_sum = sum(focal(v, masks) for v in pixels[name])
         anomaly_dice = sum(dice(v[:, 1].contiguous(), masks) for v in pixels[name])
@@ -113,9 +118,10 @@ def verify_joint_optimizer(snapshot, adapters, rma, optimizer):
 
 
 def require_joint_gradients(adapters, rma):
-    """Catch no_grad/detach mistakes in all four participating adapters."""
+    """Catch no_grad/detach mistakes in every participating adapter."""
     import torch
-    for name, module in zip(('TA', 'VA', 'PQA', 'RMA'), (*adapters, rma)):
+    modules = (*adapters, rma) if rma is not None else adapters
+    for name, module in zip(('TA', 'VA', 'PQA', 'RMA'), modules):
         grads = [p.grad for p in module.parameters() if p.grad is not None]
         if not grads or not all(torch.isfinite(g).all() for g in grads) or not any(torch.count_nonzero(g) for g in grads):
             raise RuntimeError(f'{name} has no finite nonzero training gradient.')
