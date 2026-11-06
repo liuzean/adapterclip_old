@@ -229,15 +229,15 @@ def select_beta(tables):
     return best['Beta'], rows
 
 
-def summarize(session, jobs, datasets):
+def summarize(session, jobs, datasets, *, candidate=CANDIDATE):
     combined, deltas = [], []
     for dataset, shot in jobs:
         values = read_csv(session/dataset/f'{shot}shot_seed10'/'metrics_combined.csv')
         combined.extend(dict(Dataset=dataset, Shot=shot, **r) for r in values)
         means = {r['Condition']: r for r in values if r['Category'] == 'Mean'}
         for comparator in ('G0_L1', 'baseline', 'G1_L1'):
-            change = {f: float(means[CANDIDATE][f])-float(means[comparator][f]) for f in FIELDS}
-            deltas.append(dict(Dataset=dataset, Shot=shot, Condition=CANDIDATE, Comparator=comparator,
+            change = {f: float(means[candidate][f])-float(means[comparator][f]) for f in FIELDS}
+            deltas.append(dict(Dataset=dataset, Shot=shot, Condition=candidate, Comparator=comparator,
                                **change, Net=sum(change.values())))
     for filename, mean in [('metrics_summary.csv', True), ('metrics_by_category.csv', False)]:
         write_csv(session/filename, ['Dataset', 'Shot', 'Category', 'Condition', *FIELDS],

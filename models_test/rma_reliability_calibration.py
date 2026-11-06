@@ -10,12 +10,16 @@ from rma_reliability_utils import (BETAS, RULE, SELECTION, ReliabilityBuffer, di
 from rma_utils import check_frozen, cleanup, digest, failure_status, save_tables
 
 
-def worker(args, session, checkpoint, checkpoint_hash):
+def worker(args, session, checkpoint, checkpoint_hash, *, experiment=None):
     """One held-out MVTec shot in one process; all four strengths share features."""
     import torch
     from fusion_ablation import infer_batch
     from test import prompt_association
     from tqdm import tqdm
+    rule = RULE if experiment is None else experiment.RULE
+    choices = [(0., 'G0_L1'), *[(b, f'beta_{int(b)}') for b in BETAS[1:]]] if experiment is None else experiment.CHOICES
+    diagnostic = dispersion_map if experiment is None else experiment.dispersion_map
+    fuse = gated_output if experiment is None else experiment.gated_output
     output = session/'calibration'/f'{args._shot}shot_seed10'
     output.mkdir(parents=True, exist_ok=False)
     logger = logging.getLogger('rma-reliability-source'); logger.setLevel(logging.INFO)
@@ -27,7 +31,8 @@ def worker(args, session, checkpoint, checkpoint_hash):
             raise ValueError('Source/checkpoint changed since preflight.')
         write_json(output/'source_audit.json', audit)
         write_json(output/'experiment_config.json', dict(source['config'], evaluation_shot=args._shot,
-            checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_hash, rule=RULE, betas=list(BETAS),
+            checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_hash, rule=rule, candidate_parameters=choices,
+            **({'betas': list(BETAS)} if experiment is None else {'fractions': [v for v, _ in choices]}),
             num_workers=args.num_workers))
         root = Path(source['config']['test_data_path'])
         manifest = [dict(Category=r['cls_name'], Image=str((root/r['img_path']).resolve()), Label=int(r['anomaly']))
@@ -40,7 +45,7 @@ def worker(args, session, checkpoint, checkpoint_hash):
         # and batch2 as new-D source_validation; ONLY its first S refs used below.
         loader.dataset.data_all = split['validation_queries']
         loader.dataset.length = len(manifest)
-        names = ('G0_L1', *[f'beta_{int(b)}' for b in BETAS if b > 0], 'G1_L1')
+        names = (*[name for _, name in choices], 'G1_L1')
         pixels, images, scores_saved, count, buffer, closed = [], [], [], 0, None, set()
 
         def flush():
@@ -59,11 +64,10 @@ def worker(args, session, checkpoint, checkpoint_hash):
                 old, maps0, scores0, _, _, fixed, extra = infer_batch(config, features, patches, pf, pp, *adapters, text, items['img_path'])
                 g, l = rma(patches, pp)
                 raw, maps, scores, _ = route_outputs(old, maps0, scores0, fixed, extra, g, l, config.sigma)
-                dispersion = dispersion_map(patches, pp, config.image_size, chunk=rma.spec['chunk'])
+                dispersion = diagnostic(patches, pp, config.image_size, chunk=rma.spec['chunk'])
                 endpoint = (raw['G0_L1'], maps['G0_L1'], scores['G0_L1'])
-                for beta in BETAS[1:]:
-                    name = f'beta_{int(beta)}'
-                    raw[name], maps[name], scores[name], _ = gated_output(old, fixed, extra, l, dispersion, beta, config.sigma, endpoint)
+                for value, name in choices[1:]:
+                    raw[name], maps[name], scores[name], _ = fuse(old, fixed, extra, l, dispersion, value, config.sigma, endpoint)
                 for i, category in enumerate(items['cls_name']):
                     label = int(items['anomaly'][i]); expected = manifest[count]
                     if category != expected['Category'] or path_key(items['img_path'][i]) != path_key(expected['Image']) or label != expected['Label']:

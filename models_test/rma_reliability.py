@@ -25,8 +25,8 @@ from rma_reliability_utils import (BETAS, CANDIDATE, CONDITIONS, RULE, SELECTION
 from rma_utils import check_frozen, cleanup, digest, failure_status, run_child, save_tables
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+def parse_args(argv=None, *, description=__doc__):
+    p = argparse.ArgumentParser(description=description, allow_abbrev=False)
     p.add_argument('--datasets', nargs='+', choices=DATASETS, default=list(DATASETS))
     p.add_argument('--shots', nargs='+', type=int, choices=(1, 2, 4), default=[1, 2, 4])
     p.add_argument('--new_d_run', default='results/test_rma_scratch_new/six_datasets_seed10')
@@ -44,6 +44,7 @@ def parse_args(argv=None):
     p.add_argument('--_phase', choices=('calibrate', 'target'), help=argparse.SUPPRESS)
     p.add_argument('--_dataset', choices=DATASETS, help=argparse.SUPPRESS)
     p.add_argument('--_shot', type=int, choices=(1, 2, 4), help=argparse.SUPPRESS)
+    p.add_argument('--_progress_file', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.num_workers < 0 or args.shots != sorted(set(args.shots)) or len(args.datasets) != len(set(args.datasets)):
         p.error('Unique datasets, ascending unique shots, nonnegative workers required.')
@@ -83,7 +84,7 @@ def target_inputs(args, dataset, shot, checkpoint_hash):
     return source, control, audit
 
 
-def save_sample(args, source, output, sample, image, mask, raw, maps, dispersion, alpha, index):
+def save_sample(args, source, output, sample, image, mask, raw, maps, dispersion, alpha, index, *, conditions=CONDITIONS, alphas=None):
     """Preserve baseline matrix checks; optional selected reliability matrices."""
     from test_rma_joint import save_example
     options = SimpleNamespace(**dict(vars(args), save_visualizations=False))
@@ -92,38 +93,57 @@ def save_sample(args, source, output, sample, image, mask, raw, maps, dispersion
     if args.save_maps:
         import numpy as np
         directory = output/'reliability_maps'/relative.parent; directory.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(directory/f'{relative.name}.npz',
-            dispersion=dispersion[index].cpu().numpy(), rma_fraction=alpha[index].cpu().numpy())
+        arrays = dict(rma_fraction=alpha[index].cpu().numpy())
+        if dispersion is not None:
+            arrays['dispersion'] = dispersion[index].cpu().numpy()
+        if alphas is not None:
+            arrays.update({f'rma_fraction_{n}': v[index].cpu().numpy() for n, v in alphas.items()})
+        np.savez_compressed(directory/f'{relative.name}.npz', **arrays)
     if args.save_visualizations:
         arrays = {n: v[index].detach().cpu().numpy() for n, v in maps.items()}
         original = {n: v[index].detach().cpu().numpy() for n, v in raw.items()}
+        title = 'Original A / G0_L1 / full new D / reliability gate' if conditions == CONDITIONS else 'Original A / G0_L1 / full new D / fixed local fraction'
+        if any(n.startswith('beta_') for n in conditions):
+            title = 'Original A / beta0 G0_L1 / full new D / beta4,16,64'
         save_panels(output/'visualizations'/relative.with_suffix('.png'), image, mask.cpu().numpy(),
-                    original, arrays, list(CONDITIONS), 2, 'Original A / G0_L1 / full new D / reliability gate')
+                    original, arrays, list(conditions), 2, title)
     return checks
 
 
-def target_worker(args, session, checkpoint, checkpoint_hash):
+def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None):
     import torch
     from fusion_ablation import infer_batch
     from test import prompt_association
     from tqdm import tqdm
+    candidate = CANDIDATE if experiment is None else experiment.CANDIDATE
+    conditions = CONDITIONS if experiment is None else experiment.CONDITIONS
+    rule = RULE if experiment is None else experiment.RULE
+    parameter = 'beta' if experiment is None else experiment.PARAMETER
+    verify = verify_calibration if experiment is None else experiment.verify_calibration
+    diagnostic = dispersion_map if experiment is None else experiment.dispersion_map
+    fuse = gated_output if experiment is None else experiment.gated_output
+    parameter_grid = None if experiment is None else getattr(experiment, 'CANDIDATE_PARAMETERS', None)
     output = session/args._dataset/f'{args._shot}shot_seed10'; output.mkdir(parents=True, exist_ok=False)
     logger = logging.getLogger('rma-reliability'); logger.setLevel(logging.INFO)
     handler = logging.FileHandler(output/'test.log', encoding='utf-8'); logger.addHandler(handler)
     try:
         campaign = read_json(session/'campaign_config.json')
         calibration = Path(campaign['calibration'])
-        locked = verify_calibration(calibration, checkpoint, checkpoint_hash)
+        locked = verify(calibration, checkpoint, checkpoint_hash)
         if digest(calibration/'locked_config.json') != campaign['calibration_sha256']:
             raise ValueError('Locked source selection changed after target preflight.')
-        beta = locked['beta']
+        beta = locked[parameter]
+        candidate_parameters = {candidate: beta} if parameter_grid is None else dict(parameter_grid)
+        if candidate_parameters.get(candidate) != beta or not set(candidate_parameters).issubset(conditions):
+            raise ValueError('Invalid candidate parameter grid.')
         source, control, audit = target_inputs(args, args._dataset, args._shot, checkpoint_hash)
         if audit != read_json(session/'input_audit.json')[args._dataset][str(args._shot)]:
             raise ValueError('Target inputs changed since preflight.')
         write_json(output/'experiment_config.json', dict(source['config'], checkpoint_sha256=checkpoint_hash,
-            new_d_checkpoint=str(checkpoint), weight_epoch=14, rule=RULE, beta=beta, conditions=list(CONDITIONS),
+            new_d_checkpoint=str(checkpoint), weight_epoch=14, rule=rule, **{parameter: beta}, conditions=list(conditions),
             calibration=str(calibration), calibration_sha256=campaign['calibration_sha256'], align_used=True,
-            rma_global_used_by_candidate=False, max_rma_local_fraction=.25, num_workers=args.num_workers,
+            rma_global_used_by_candidate=False, candidate_parameters=candidate_parameters,
+            max_rma_local_fraction=.25 if parameter == 'beta' else .375, num_workers=args.num_workers,
             save_maps=args.save_maps, save_visualizations=args.save_visualizations))
         write_json(output/'input_audit.json', audit)
         write_csv(output/'references.csv', ['Category', 'Image Path'], [{'Category': c, 'Image Path': p} for c, p in source['reference_paths']])
@@ -150,7 +170,7 @@ def target_worker(args, session, checkpoint, checkpoint_hash):
             save_tables(output, pixels, images); persist(); cleanup()
 
         with torch.no_grad():
-            for items in tqdm(loader, desc=f'{args._dataset} {args._shot}-shot / RMA reliability beta={beta:g}'):
+            for items in tqdm(loader, desc=f'{args._dataset} {args._shot}-shot / RMA {parameter}={beta:g}'):
                 paths = items['img_path']; classes = items['cls_name']
                 features, patches = model.encode_image(items['img'].to(device), config.features_list, DPAM_layer=dpam)
                 pf, pp = prompt_association(*memory, classes)
@@ -159,14 +179,18 @@ def target_worker(args, session, checkpoint, checkpoint_hash):
                 old, maps0, scores0, _, _, fixed, extra = infer_batch(config, features, patches, pf, pp, *adapters, candidate_text, paths)
                 g, l = rma(patches, pp)
                 raw, maps, scores, _ = route_outputs(old, maps0, scores0, fixed, extra, g, l, config.sigma)
-                dispersion = dispersion_map(patches, pp, config.image_size, chunk=rma.spec['chunk'])
-                raw[CANDIDATE], maps[CANDIDATE], scores[CANDIDATE], alpha = gated_output(old, fixed, extra, l,
-                    dispersion, beta, config.sigma, (raw['G0_L1'], maps['G0_L1'], scores['G0_L1']))
+                dispersion = diagnostic(patches, pp, config.image_size, chunk=rma.spec['chunk'])
+                alphas = {}
+                endpoint = (raw['G0_L1'], maps['G0_L1'], scores['G0_L1'])
+                for name, value in candidate_parameters.items():
+                    raw[name], maps[name], scores[name], alphas[name] = fuse(old, fixed, extra, l,
+                        dispersion, value, config.sigma, endpoint)
+                alpha = alphas[candidate]
                 raw['baseline'] = a_raw['baseline']; maps['baseline'] = a_maps['baseline']; scores['baseline'] = a_scores['baseline']
-                raw = {n: raw[n] for n in CONDITIONS}; maps = {n: maps[n] for n in CONDITIONS}; scores = {n: scores[n] for n in CONDITIONS}
+                raw = {n: raw[n] for n in conditions}; maps = {n: maps[n] for n in conditions}; scores = {n: scores[n] for n in conditions}
                 if versions != [v._version for v in (features, pf, *patches, *pp)]:
                     raise ValueError('Candidate modified shared features.')
-                for name in CONDITIONS:
+                for name in conditions:
                     if maps[name].shape != items['img_mask'][:, 0].shape or scores[name].shape != (len(paths),):
                         raise ValueError('Wrong output shape.')
                     if not all(torch.isfinite(v).all() for v in (raw[name], maps[name], scores[name])):
@@ -183,12 +207,15 @@ def target_worker(args, session, checkpoint, checkpoint_hash):
                             flush(); closed.add(buffer.category)
                         if category in closed:
                             raise ValueError('Noncontiguous target classes.')
-                        buffer = ReliabilityBuffer(category)
+                        buffer = ReliabilityBuffer(category, conditions=conditions)
                     buffer.append(masks[i], label, maps, scores, i)
                     scores_saved.append(dict(Category=category, **{'Image Path': paths[i]}, Label=label,
-                        **{f'{n} Image Score': float(scores[n][i]) for n in CONDITIONS},
-                        DispersionMean=float(dispersion[i].mean()), RMAFractionMean=float(alpha[i].mean()),
-                        RMAFractionMin=float(alpha[i].min()), RMAFractionMax=float(alpha[i].max()), Beta=beta))
+                        **{f'{n} Image Score': float(scores[n][i]) for n in conditions},
+                        DispersionMean=None if dispersion is None else float(dispersion[i].mean()), RMAFractionMean=float(alpha[i].mean()),
+                        RMAFractionMin=float(alpha[i].min()), RMAFractionMax=float(alpha[i].max()),
+                        **{'Beta' if parameter == 'beta' else 'RMAFraction': beta},
+                        **({f'{n} RMAFraction{label}': float(getattr(v[i], method)()) for n, v in alphas.items()
+                            for label, method in [('Mean', 'mean'), ('Min', 'min'), ('Max', 'max')]} if parameter_grid is not None else {})))
                     for name in ('baseline', 'G0_L1', 'G1_L1'):
                         passed = math.isclose(float(scores[name][i]), float(h[f'{name} Image Score']), abs_tol=1e-6, rel_tol=1e-5)
                         checks.append(dict(Image=paths[i], Condition=name, Passed=passed))
@@ -200,13 +227,14 @@ def target_worker(args, session, checkpoint, checkpoint_hash):
                         persist(); raise ValueError('Original A/G0_L1/full new-D historical score parity failed.')
                     key = path_key(paths[i])
                     if key in selected:
-                        matrix_checks.extend(save_sample(args, source, output, selected[key], items['img'][i], masks[i], raw, maps, dispersion, alpha, i))
+                        matrix_checks.extend(save_sample(args, source, output, selected[key], items['img'][i], masks[i], raw, maps, dispersion, alpha, i,
+                            conditions=conditions, alphas=alphas if parameter_grid is not None else None))
                         visited.add(key)
                         if not all(r['Passed'] for r in matrix_checks):
                             persist(); raise ValueError('Original-A selected map parity failed.')
                     count += 1
                 batches += 1
-                del features, patches, pf, pp, a_raw, a_maps, a_scores, old, maps0, scores0, g, l, raw, maps, scores, dispersion, alpha, extra
+                del features, patches, pf, pp, a_raw, a_maps, a_scores, old, maps0, scores0, g, l, raw, maps, scores, dispersion, alpha, alphas, endpoint, extra
         if buffer is None or count != len(source['manifest']) or visited != set(selected):
             raise ValueError('Incomplete target coverage.')
         flush(); table = save_tables(output, pixels, images)
@@ -220,7 +248,8 @@ def target_worker(args, session, checkpoint, checkpoint_hash):
         if digest(checkpoint) != checkpoint_hash or digest(calibration/'locked_config.json') != campaign['calibration_sha256']:
             raise ValueError('Checkpoint/calibration changed during evaluation.')
         write_json(output/'run_status.json', dict(status='completed', complete=True, sample_count=count,
-            query_encoder_calls=batches, new_D_adapter_calls=batches, rma_calls=batches, beta=beta,
+            query_encoder_calls=batches, new_D_adapter_calls=batches, rma_calls=batches, **{parameter: beta},
+            candidate_parameters=candidate_parameters,
             endpoint_parity_passed=True, frozen_integrity_passed=True, weight_epoch=14, align_used=True))
     except BaseException as error:
         failure_status(output, error); logger.exception('RMA reliability evaluation stopped.'); raise
