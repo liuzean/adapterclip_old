@@ -105,6 +105,8 @@ def save_sample(args, source, output, sample, image, mask, raw, maps, dispersion
         title = 'Original A / G0_L1 / full new D / reliability gate' if conditions == CONDITIONS else 'Original A / G0_L1 / full new D / fixed local fraction'
         if any(n.startswith('beta_') for n in conditions):
             title = 'Original A / beta0 G0_L1 / full new D / beta4,16,64'
+        if 'dual_output' in conditions:
+            title = 'Original A / G0_L1 / full new D / local candidate / dual output'
         save_panels(output/'visualizations'/relative.with_suffix('.png'), image, mask.cpu().numpy(),
                     original, arrays, list(conditions), 2, title)
     return checks
@@ -123,6 +125,9 @@ def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None
     diagnostic = dispersion_map if experiment is None else experiment.dispersion_map
     fuse = gated_output if experiment is None else experiment.gated_output
     parameter_grid = None if experiment is None else getattr(experiment, 'CANDIDATE_PARAMETERS', None)
+    output_adapter = None if experiment is None else getattr(experiment, 'OUTPUT_ADAPTER', None)
+    buffer_factory = ReliabilityBuffer if experiment is None else getattr(experiment, 'BUFFER_FACTORY', ReliabilityBuffer)
+    final_check = None if experiment is None else getattr(experiment, 'FINAL_CHECK', None)
     output = session/args._dataset/f'{args._shot}shot_seed10'; output.mkdir(parents=True, exist_ok=False)
     logger = logging.getLogger('rma-reliability'); logger.setLevel(logging.INFO)
     handler = logging.FileHandler(output/'test.log', encoding='utf-8'); logger.addHandler(handler)
@@ -143,8 +148,12 @@ def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None
             new_d_checkpoint=str(checkpoint), weight_epoch=14, rule=rule, **{parameter: beta}, conditions=list(conditions),
             calibration=str(calibration), calibration_sha256=campaign['calibration_sha256'], align_used=True,
             rma_global_used_by_candidate=False, candidate_parameters=candidate_parameters,
-            max_rma_local_fraction=.25 if parameter == 'beta' else .375, num_workers=args.num_workers,
+            max_rma_local_fraction=.25 if parameter == 'beta' else max(candidate_parameters.values()), num_workers=args.num_workers,
             save_maps=args.save_maps, save_visualizations=args.save_visualizations))
+        if experiment is not None and hasattr(experiment, 'OUTPUT_DEFINITION'):
+            saved_config = read_json(output/'experiment_config.json')
+            saved_config['output_definition'] = experiment.OUTPUT_DEFINITION
+            write_json(output/'experiment_config.json', saved_config)
         write_json(output/'input_audit.json', audit)
         write_csv(output/'references.csv', ['Category', 'Image Path'], [{'Category': c, 'Image Path': p} for c, p in source['reference_paths']])
         write_csv(output/'sample_manifest.csv', list(source['manifest'][0]), source['manifest'])
@@ -187,6 +196,8 @@ def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None
                         dispersion, value, config.sigma, endpoint)
                 alpha = alphas[candidate]
                 raw['baseline'] = a_raw['baseline']; maps['baseline'] = a_maps['baseline']; scores['baseline'] = a_scores['baseline']
+                if output_adapter is not None:
+                    output_adapter(raw, maps, scores)
                 raw = {n: raw[n] for n in conditions}; maps = {n: maps[n] for n in conditions}; scores = {n: scores[n] for n in conditions}
                 if versions != [v._version for v in (features, pf, *patches, *pp)]:
                     raise ValueError('Candidate modified shared features.')
@@ -207,7 +218,7 @@ def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None
                             flush(); closed.add(buffer.category)
                         if category in closed:
                             raise ValueError('Noncontiguous target classes.')
-                        buffer = ReliabilityBuffer(category, conditions=conditions)
+                        buffer = buffer_factory(category, conditions=conditions)
                     buffer.append(masks[i], label, maps, scores, i)
                     scores_saved.append(dict(Category=category, **{'Image Path': paths[i]}, Label=label,
                         **{f'{n} Image Score': float(scores[n][i]) for n in conditions},
@@ -247,10 +258,11 @@ def target_worker(args, session, checkpoint, checkpoint_hash, *, experiment=None
             check_frozen(snapshot)
         if digest(checkpoint) != checkpoint_hash or digest(calibration/'locked_config.json') != campaign['calibration_sha256']:
             raise ValueError('Checkpoint/calibration changed during evaluation.')
+        additional_checks = {} if final_check is None else final_check(output, table)
         write_json(output/'run_status.json', dict(status='completed', complete=True, sample_count=count,
             query_encoder_calls=batches, new_D_adapter_calls=batches, rma_calls=batches, **{parameter: beta},
             candidate_parameters=candidate_parameters,
-            endpoint_parity_passed=True, frozen_integrity_passed=True, weight_epoch=14, align_used=True))
+            endpoint_parity_passed=True, frozen_integrity_passed=True, weight_epoch=14, align_used=True, **additional_checks))
     except BaseException as error:
         failure_status(output, error); logger.exception('RMA reliability evaluation stopped.'); raise
     finally:
