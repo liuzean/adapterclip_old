@@ -36,7 +36,7 @@ PROFILES = {
 }
 
 
-def parse_training(flow, argv=None, *, three_adapter_control=False):
+def parse_training(flow, argv=None, *, three_adapter_control=False, matching_control=False):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument('--train_data_path', default='E:/projects/datasets/mvtec')
     p.add_argument('--pretrained_model', default='E:/projects/FSAD/AdaptCLIP/checkpoint/train_base/ViT-L-14-336px.pt')
@@ -52,14 +52,20 @@ def parse_training(flow, argv=None, *, three_adapter_control=False):
     p.add_argument('--hidden_dim', type=int, default=128)
     p.add_argument('--top_k', type=int, default=8)
     p.add_argument('--match_chunk', type=int, default=128)
-    p.add_argument('--matching', choices=('learned', 'uniform', 'top1'), default='learned')
-    if three_adapter_control:
+    p.add_argument('--matching', choices=('learned', 'uniform', 'top1', 'cosine'),
+                   default='cosine' if matching_control else 'learned')
+    if three_adapter_control or matching_control:
         p.add_argument('--matched_new_d_run', default='results/train_rma_scratch_new/mvtec_seed10',
                        help='Completed new-D training whose settings, split and episodes must match.')
+    if matching_control:
+        p.add_argument('--resume_training_from',help='Fork a completed epoch checkpoint/history; source stays intact.')
     p.add_argument('--_progress_file', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     args.flow, args.seed = flow, 10
     args.three_adapter_control = three_adapter_control
+    args.matching_control = matching_control
+    if matching_control and (flow != 'new' or three_adapter_control or args.matching != 'cosine'):
+        p.error('Matching control requires new flow, four adapters and cosine weighting.')
     if three_adapter_control and flow != 'new':
         p.error('The matched three-adapter control uses the new-D flow only.')
     args.overrides = []
@@ -79,8 +85,10 @@ def parse_training(flow, argv=None, *, three_adapter_control=False):
         p.error('Invalid optimizer or validation settings.')
     for name in ('train_data_path', 'pretrained_model', 'baseline_checkpoint'):
         setattr(args, name, project_path(getattr(args, name), ROOT))
-    if three_adapter_control:
+    if three_adapter_control or matching_control:
         args.matched_new_d_run = project_path(args.matched_new_d_run, ROOT)
+    if matching_control and args.resume_training_from:
+        args.resume_training_from=project_path(args.resume_training_from,ROOT)
     return args
 
 
@@ -131,7 +139,7 @@ def initialize_fresh(args, config):
     return model, adapters, rma
 
 
-def source_validation(config, model, adapters, rma, loader, memory, output, epoch):
+def source_validation(config, model, adapters, rma, loader, memory, output, epoch, *, progress=None):
     """Source-held-out full-model score; the three-control never calls RMA."""
     import torch
     from test import prompt_association
@@ -144,7 +152,10 @@ def source_validation(config, model, adapters, rma, loader, memory, output, epoc
             pixels, images, buffer = [], [], None
             directory = output/'validation'/f'epoch_{epoch:03d}'/f'{shot}shot'
             directory.mkdir(parents=True)
-            for items in loader:
+            for val_step, items in enumerate(loader,1):
+                if progress:
+                    progress('source_validation',validation_shot=shot,validation_batch=val_step,
+                             validation_batches=len(loader),validation_completed_batches=val_step-1)
                 features, patches = model.encode_image(items['img'].cuda(), config.features_list, DPAM_layer=20)
                 pf, pp = prompt_association(*memory, items['cls_name'])
                 pf, pp = pf[:, :shot].cuda(), [p[:, :shot].cuda() for p in pp]
@@ -158,6 +169,8 @@ def source_validation(config, model, adapters, rma, loader, memory, output, epoc
                             images.extend(q)
                         buffer = MetricsBuffer(category, conditions=('scratch',))
                     buffer.append(items['img_mask'][i, 0] > .5, items['anomaly'][i], {'scratch': maps}, {'scratch': scores}, i)
+                if progress:
+                    progress('source_validation',validation_completed_batches=val_step)
             if buffer is None:
                 raise ValueError('Empty source validation.')
             p, q = buffer.finish('cuda')
@@ -228,12 +241,19 @@ def train(args, output, logger):
     from fusion_ablation_utils import RecordedPromptDataset
     from test import build_prompt_memory
     from tqdm import tqdm
+    progress=None
+    if args.matching_control:
+        from rma_matching_control_utils import record_training_progress
+        def progress(phase, **details):
+            record_training_progress(output,phase,**details)
+        progress('initializing',total_epochs=args.epochs,completed_epochs=0,epoch=0,
+                 batch=0,completed_batches=0)
     setup_seed(10)
     config = protocol(args)
     model, adapters, rma = initialize_fresh(args, config)
     frozen = freeze_base([None, model])
     modules = (*adapters, rma) if rma is not None else adapters
-    parameters = [p for m in modules for p in m.parameters()]
+    parameters = [p for m in modules for p in m.parameters() if p.requires_grad]
     optimizer_class = torch.optim.Adam if args.optimizer == 'adam' else torch.optim.AdamW
     optimizer = optimizer_class(parameters, lr=args.learning_rate, betas=tuple(args.betas), weight_decay=args.weight_decay)
     check_frozen(frozen, optimizer)
@@ -268,6 +288,9 @@ def train(args, output, logger):
     if args.three_adapter_control:
         from new_d_control_utils import check_training_inputs
         expected_episodes = check_training_inputs(args, output)
+    elif args.matching_control:
+        from rma_matching_control_utils import check_control_inputs
+        expected_episodes = check_control_inputs(args, output)
     metadata = dict(format=FORMAT if rma is not None else THREE_FORMAT, flow=args.flow,
         initialization='CLIP pretrained; all four adapters fresh' if rma is not None else THREE_INITIALIZATION,
         training_scheme=f'scratch_{args.flow}' if rma is not None else 'new_flow_three_adapter_control',
@@ -276,23 +299,44 @@ def train(args, output, logger):
         train_options={k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         source_meta_sha256=digest(args.train_data_path/'meta.json'), seed=10,
         matched_new_flow_three_adapter_control=rma is None,
+        matched_cosine_weighting_control=args.matching_control,
+        resumed_training_from=str(args.resume_training_from) if args.matching_control and args.resume_training_from else None,
         source_validation_used=args.flow == 'new',
         validation_fraction_used=args.validation_fraction if args.flow == 'new' else None,
         comparator_checkpoint_role='original A identity only; NEVER loaded into training',
         selection_rule='minimum epoch mean global_loss + local_loss; earliest on tie; no validation selection' if args.flow == 'original' else 'best held-out source six-metric / 1,2,4-shot mean')
     write_json(output/'model_manifest.json', dict(**metadata, train_query_count=len(data),
-        validation_query_count=0 if val_loader is None else len(val_loader.dataset), frozen_modules=['CLIP'],
+        validation_query_count=0 if val_loader is None else len(val_loader.dataset),
+        frozen_modules=['CLIP']+(['RMA.key'] if args.matching_control else []),
         trainable_modules=['VA','TA','PQA','RMA'] if rma is not None else ['VA','TA','PQA'],
         trainable_parameters=sum(p.numel() for p in parameters)))
+    if args.matching_control:
+        if any(p.requires_grad for p in rma.key.parameters()):
+            raise ValueError('Cosine-only control must freeze the unused K projection.')
     focal, dice, rng = FocalLoss(), BinaryDiceLoss(), random.Random(10)
     history, steps, episodes, validation_rows = [], [], [], []
     best_value, best_epoch = (math.inf if args.flow == 'original' else -math.inf), None
-    for epoch in range(1, args.epochs+1):
+    first_epoch=1
+    if args.matching_control and args.resume_training_from:
+        from rma_control_resume import restore_training
+        restored=restore_training(args,output,adapters,rma,optimizer,model,loader,val_loader,split,rng,progress)
+        history,steps,episodes,validation_rows=(restored[k] for k in ('history','steps','episodes','validation_rows'))
+        best_value,best_epoch,first_epoch=(restored[k] for k in ('best_value','best_epoch','first_epoch'))
+        logger.info('Recovered optimizer/adapters from epoch %s; next epoch=%s; historical best=%s',first_epoch-1,first_epoch,best_epoch)
+        print(f'恢复完成：从epoch={first_epoch}继续至{args.epochs}；前{first_epoch-1}轮不重复模型训练。',flush=True)
+    for epoch in range(first_epoch, args.epochs+1):
+        if progress:
+            progress('training',epoch=epoch,completed_epochs=len(history),batch=0,
+                     completed_batches=0,total_batches=len(loader),validation_shot=None,
+                     validation_batch=None,validation_completed_batches=0)
         for m in modules:
             m.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_rows = []
         for step, items in enumerate(tqdm(loader, desc=f'Scratch {args.flow} {epoch}/{args.epochs}')):
+            if progress:
+                progress('training',batch=step+1,completed_batches=step,
+                         categories=list(dict.fromkeys(items['cls_name'])))
             batch = len(items['img_path'])
             if args.flow == 'original':
                 prompt_images = items['prompt_img'].cuda()
@@ -309,7 +353,8 @@ def train(args, output, logger):
                     episodes.append(dict(epoch=epoch, step=step+1, query=path, category=category, shot=shot,
                                          references=' | '.join(r['img_path'] for r in chosen)))
                     if expected_episodes is not None:
-                        if {k:str(v) for k,v in episodes[-1].items()} != expected_episodes[len(episodes)-1]:
+                        if (len(episodes)>len(expected_episodes)
+                                or {k:str(v) for k,v in episodes[-1].items()} != expected_episodes[len(episodes)-1]):
                             raise ValueError('Training episode differs from matched new D; no matched-control claim is valid.')
                 support_data = RecordedPromptDataset(str(args.train_data_path), refs, split['classes'], transform, target_transform)
                 prompt_images = torch.stack([support_data[i]['img'] for i in range(len(support_data))]).cuda()
@@ -334,11 +379,12 @@ def train(args, output, logger):
                        **{k:float(v.detach()) for k,v in parts.items()})
             steps.append(row)
             epoch_rows.append(row)
+            if progress:progress('training',completed_batches=step+1)
             del loss, parts, globals_, pixels, raw, prompt_images, features, patches, pf, pp
         check_frozen(frozen, optimizer)
         score = None
         if args.flow == 'new':
-            score, val_rows = source_validation(config, model, adapters, rma, val_loader, memory, output, epoch)
+            score, val_rows = source_validation(config, model, adapters, rma, val_loader, memory, output, epoch,progress=progress)
             validation_rows.extend(val_rows)
             write_csv(output/'validation_metrics.csv', ['epoch','shot','Category','Condition',*FIELDS], validation_rows)
         summary = dict(epoch=epoch, **{k:sum(r[k] for r in epoch_rows)/len(epoch_rows)
@@ -351,10 +397,12 @@ def train(args, output, logger):
                        validation_score=score, best_epoch=best_epoch,
                        best_score=best_value if args.flow == 'new' else None,
                        best_training_loss=best_value if args.flow == 'original' else None)
+        if progress:progress('saving_checkpoint',best_epoch=best_epoch)
         atomic_checkpoint(output/f'epoch_{epoch}.pth', payload)
         if improved:
             atomic_checkpoint(output/'best.pth', payload)
-        atomic_checkpoint(output/'last.pth', dict(**payload, optimizer=optimizer.state_dict()))
+        if not args.matching_control:
+            atomic_checkpoint(output/'last.pth', dict(**payload, optimizer=optimizer.state_dict()))
         write_csv(output/'training_history.csv', list(history[0]), history)
         write_csv(output/'training_steps.csv', list(steps[0]), steps)
         if episodes:
@@ -369,26 +417,44 @@ def train(args, output, logger):
             best_training_loss=best_value if args.flow == 'original' else None,
             best_score=best_value if args.flow == 'new' else None))
         cleanup()
+        if args.matching_control:
+            from rma_control_resume import capture_rng
+            atomic_checkpoint(output/'last.pth',dict(**payload,optimizer=optimizer.state_dict(),resume_rng=capture_rng(rng)))
+        if progress:progress('epoch_complete',completed_epochs=epoch,last_checkpoint=str(output/'last.pth'))
     selected = output/'best.pth'
     if expected_episodes is not None and len(episodes) != len(expected_episodes):
         raise ValueError('Incomplete matched new-D episode coverage.')
+    if args.matching_control:
+        from rma_matching_control_utils import verify_control_inputs
+        verify_control_inputs(output)
     return dict(status='completed', complete=True, epochs=args.epochs, flow=args.flow,
                 selected_checkpoint=str(selected), best_epoch=best_epoch,
                 best_training_loss=best_value if args.flow == 'original' else None,
                 best_score=best_value if args.flow == 'new' else None,
                 frozen_integrity_passed=True,
+                matched_cosine_weighting_control=args.matching_control,
                 **({'four_adapter_gradient_checks_passed':True} if rma is not None else {'three_adapter_gradient_checks_passed':True}))
 
 
-def training_main(flow, entry_stem, argv=None, *, three_adapter_control=False):
-    args = parse_training(flow, argv, three_adapter_control=three_adapter_control)
+def training_main(flow, entry_stem, argv=None, *, three_adapter_control=False, matching_control=False):
+    args = parse_training(flow, argv, three_adapter_control=three_adapter_control, matching_control=matching_control)
     for path in (args.train_data_path/'meta.json', args.pretrained_model, args.baseline_checkpoint):
         if not path.is_file():
             raise FileNotFoundError(path)
     if three_adapter_control:
         from new_d_control_utils import check_training_settings
         check_training_settings(args)
+    elif matching_control:
+        from rma_matching_control_utils import check_control_settings
+        check_control_settings(args)
+        if args.resume_training_from:
+            from rma_control_resume import inspect_source
+            inspect_source(args.resume_training_from,args)
     output = new_directory(ROOT/'results'/entry_stem, 'mvtec_seed10')
+    resume_info=None
+    if matching_control and args.resume_training_from:
+        from rma_control_resume import fork_source
+        resume_info=fork_source(args.resume_training_from,output,args)
     receipt = project_path(args._progress_file, ROOT) if args._progress_file else None
     record_pipeline_progress(receipt, 'training', session=str(output), flow=flow, epochs=args.epochs)
     logger = logging.getLogger(entry_stem)
@@ -397,10 +463,18 @@ def training_main(flow, entry_stem, argv=None, *, three_adapter_control=False):
     for handler in handlers:
         logger.addHandler(handler)
     write_json(output/'experiment_config.json', {k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()})
-    write_json(output/'run_status.json', dict(status='initializing', complete=False, flow=flow))
+    initial=dict(status='initializing',complete=False,flow=flow)
+    if resume_info:
+        initial.update(epoch=resume_info['completed_epoch'],best_epoch=resume_info['best_epoch'],
+                       selected_checkpoint=str(output/'best.pth'))
+    write_json(output/'run_status.json',initial)
     try:
         state = train(args, output, logger)
         write_json(output/'run_status.json', state)
+        if args.matching_control:
+            from rma_matching_control_utils import record_training_progress
+            record_training_progress(output,'completed',completed_epochs=state['epochs'],
+                                     selected_checkpoint=state['selected_checkpoint'])
         record_pipeline_progress(receipt, 'completed', session=str(output), flow=flow,
                                  selected_checkpoint=state['selected_checkpoint'], epochs=args.epochs)
         print(f'Training completed. Test checkpoint: {state["selected_checkpoint"]}', flush=True)

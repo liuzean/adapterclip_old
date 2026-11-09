@@ -11,7 +11,8 @@ class ReferenceMatchingAdapter(nn.Module):
 
     Queries: four [B,1+L,768]; supports: four [B,S,1+L,768].
     Returns image logits [B,2] and pixel logits [B,2,H,W]. Top-K indices
-    use frozen cosine features; Q/K/V projections and relation heads learn.
+    use frozen cosine features; Q/V and relation heads learn. K learns only
+    where the matching rule uses it; cosine control freezes this unused map.
     """
 
     def __init__(self, input_dim=768, hidden_dim=128, top_k=8,
@@ -19,7 +20,7 @@ class ReferenceMatchingAdapter(nn.Module):
         super().__init__()
         if hidden_dim < 8 or hidden_dim % 8 or min(top_k, chunk, image_size) < 1:
             raise ValueError('Positive sizes and hidden_dim divisible by eight required.')
-        if matching not in ('learned', 'uniform', 'top1'):
+        if matching not in ('learned', 'uniform', 'top1', 'cosine'):
             raise ValueError('Unknown matching mode.')
         self.spec = dict(input_dim=input_dim, hidden_dim=hidden_dim, top_k=top_k,
                          image_size=image_size, chunk=chunk, matching=matching)
@@ -31,6 +32,10 @@ class ReferenceMatchingAdapter(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1), nn.GroupNorm(8, hidden_dim), nn.GELU())
         self.local_head = nn.Conv2d(hidden_dim, 2, 1)
         self.global_head = nn.Linear(hidden_dim * 2, 2)
+        if matching == 'cosine':
+            # K is used only by the ablated learned weighting term. Q still
+            # supplies relation features, so Q/V and all heads keep learning.
+            self.key.requires_grad_(False)
 
     def layer(self, queries, supports):
         """Chunk retrieval; train weights only within the same Top-K candidate set."""
@@ -54,6 +59,8 @@ class ReferenceMatchingAdapter(nn.Module):
             if self.spec['matching'] == 'learned':
                 logits = (query[:, start:end, None] * keys).sum(-1) / math.sqrt(key.shape[-1])
                 weights = (logits + similarity).softmax(-1)
+            elif self.spec['matching'] == 'cosine':
+                weights = similarity.softmax(-1)
             else:
                 weights = torch.full_like(similarity, 1.0 / k)
             matched.append((weights[..., None] * values).sum(2))

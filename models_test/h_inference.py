@@ -55,8 +55,13 @@ def recorded_inputs(reference_run, dataset, shot):
                 manifest=manifest, history=folder, meta=meta_path)
 
 
-def load_model(checkpoint, inputs, output, workers):
-    """Load only pretrained CLIP + new-D four-adapter payload; no A weights."""
+def load_model(checkpoint, inputs, output, workers, *, expected_sha=WEIGHT_SHA,
+               expected_epoch=14, expected_matching='learned'):
+    """Load a verified four-adapter payload; defaults remain fixed original H.
+
+    The matched control supplies its own verified best hash/epoch/matching mode;
+    this does not loosen test_h's fixed epoch14/learned checkpoint contract.
+    """
     import torch
     import adaptcliplib
     from adaptcliplib import TextualAdapter, VisualAdapter, PQAdapter
@@ -70,8 +75,8 @@ def load_model(checkpoint, inputs, output, workers):
     if not torch.cuda.is_available():
         raise RuntimeError('Existing CLIP text adapter requires CUDA.')
     setup_seed(10); checkpoint = Path(checkpoint)
-    if digest(checkpoint) != WEIGHT_SHA:
-        raise ValueError('Requires fixed new-D epoch14 checkpoint identity.')
+    if digest(checkpoint) != expected_sha:
+        raise ValueError('Checkpoint identity differs from the declared experiment.')
     manifest = read_json(checkpoint.parent/'model_manifest.json')
     config = SimpleNamespace(**inputs['config'])
     if digest(config.pretrained_model) != manifest['pretrained_sha256']:
@@ -80,8 +85,8 @@ def load_model(checkpoint, inputs, output, workers):
         raise ValueError('Requires original CLIP ViT-L/14@336px projected768 interface.')
     payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
     validate_scratch(payload, manifest['base_sha256'], manifest['pretrained_sha256'], inputs['config'], 'new')
-    if payload['epoch'] != 14:
-        raise ValueError('Expected epoch14.')
+    if payload['epoch'] != expected_epoch or payload['model_spec']['matching'] != expected_matching:
+        raise ValueError('Checkpoint epoch/matching mode differs from the declared experiment.')
     device='cuda'; model,_=adaptcliplib.load(config.pretrained_model,device=device)
     model.visual.DAPM_replace(DPAM_layer=20)
     textual=TextualAdapter(model.to('cpu'),config.image_size,config.n_ctx)
